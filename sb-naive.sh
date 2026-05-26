@@ -69,17 +69,27 @@ enable_bbr() {
   sysctl -p >/dev/null 2>&1 || true
 }
 
+port_in_use() {
+  local port="$1"
+  ss -lntup 2>/dev/null | grep -qE ":${port}\b"
+}
+
+check_ports() {
+  [[ "${ENABLE_NAIVE}" == "true" ]] && port_in_use "${NAIVE_PORT}" && yellow "警告：Naive 端口 ${NAIVE_PORT} 可能已被占用"
+  [[ "${ENABLE_ANYTLS}" == "true" ]] && port_in_use "${ANYTLS_PORT}" && yellow "警告：AnyTLS 端口 ${ANYTLS_PORT} 可能已被占用"
+}
+
 open_firewall() {
   if command -v ufw >/dev/null 2>&1; then
     ufw allow 80/tcp || true
-    ufw allow "${NAIVE_PORT}/tcp" || true
-    ufw allow "${ANYTLS_PORT}/tcp" || true
+    [[ "${ENABLE_NAIVE}" == "true" ]] && ufw allow "${NAIVE_PORT}/tcp" || true
+    [[ "${ENABLE_ANYTLS}" == "true" ]] && ufw allow "${ANYTLS_PORT}/tcp" || true
   fi
 
   if command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --permanent --add-port=80/tcp || true
-    firewall-cmd --permanent --add-port="${NAIVE_PORT}/tcp" || true
-    firewall-cmd --permanent --add-port="${ANYTLS_PORT}/tcp" || true
+    [[ "${ENABLE_NAIVE}" == "true" ]] && firewall-cmd --permanent --add-port="${NAIVE_PORT}/tcp" || true
+    [[ "${ENABLE_ANYTLS}" == "true" ]] && firewall-cmd --permanent --add-port="${ANYTLS_PORT}/tcp" || true
     firewall-cmd --reload || true
   fi
 }
@@ -89,6 +99,8 @@ write_meta() {
   cat > "$META_FILE" <<EOF
 DOMAIN="${DOMAIN}"
 EMAIL="${EMAIL}"
+ENABLE_NAIVE="${ENABLE_NAIVE}"
+ENABLE_ANYTLS="${ENABLE_ANYTLS}"
 NAIVE_PORT="${NAIVE_PORT}"
 NAIVE_USERNAME="${NAIVE_USERNAME}"
 NAIVE_PASSWORD="${NAIVE_PASSWORD}"
@@ -101,6 +113,67 @@ EOF
 load_meta() {
   [[ -f "$META_FILE" ]] || return 1
   source "$META_FILE"
+  ENABLE_NAIVE="${ENABLE_NAIVE:-true}"
+  ENABLE_ANYTLS="${ENABLE_ANYTLS:-false}"
+  NAIVE_PORT="${NAIVE_PORT:-443}"
+  NAIVE_USERNAME="${NAIVE_USERNAME:-}"
+  NAIVE_PASSWORD="${NAIVE_PASSWORD:-}"
+  ANYTLS_PORT="${ANYTLS_PORT:-8443}"
+  ANYTLS_NAME="${ANYTLS_NAME:-}"
+  ANYTLS_PASSWORD="${ANYTLS_PASSWORD:-}"
+}
+
+build_inbounds_json() {
+  local first="true"
+
+  if [[ "${ENABLE_NAIVE}" == "true" ]]; then
+    cat <<EOF
+    {
+      "type": "naive",
+      "tag": "naive-in",
+      "listen": "::",
+      "listen_port": ${NAIVE_PORT},
+      "network": "tcp",
+      "users": [
+        {
+          "username": "${NAIVE_USERNAME}",
+          "password": "${NAIVE_PASSWORD}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${DOMAIN}",
+        "certificate_provider": "shared-cert",
+        "handshake_timeout": "15s"
+      }
+    }
+EOF
+    first="false"
+  fi
+
+  if [[ "${ENABLE_ANYTLS}" == "true" ]]; then
+    [[ "$first" == "false" ]] && echo "    ,"
+    cat <<EOF
+    {
+      "type": "anytls",
+      "tag": "anytls-in",
+      "listen": "::",
+      "listen_port": ${ANYTLS_PORT},
+      "users": [
+        {
+          "name": "${ANYTLS_NAME}",
+          "password": "${ANYTLS_PASSWORD}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${DOMAIN}",
+        "certificate_provider": "shared-cert",
+        "handshake_timeout": "15s"
+      }
+    }
+EOF
+  fi
 }
 
 write_config() {
@@ -127,43 +200,7 @@ write_config() {
     }
   ],
   "inbounds": [
-    {
-      "type": "naive",
-      "tag": "naive-in",
-      "listen": "::",
-      "listen_port": ${NAIVE_PORT},
-      "network": "tcp",
-      "users": [
-        {
-          "username": "${NAIVE_USERNAME}",
-          "password": "${NAIVE_PASSWORD}"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${DOMAIN}",
-        "certificate_provider": "shared-cert",
-        "handshake_timeout": "15s"
-      }
-    },
-    {
-      "type": "anytls",
-      "tag": "anytls-in",
-      "listen": "::",
-      "listen_port": ${ANYTLS_PORT},
-      "users": [
-        {
-          "name": "${ANYTLS_NAME}",
-          "password": "${ANYTLS_PASSWORD}"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${DOMAIN}",
-        "certificate_provider": "shared-cert",
-        "handshake_timeout": "15s"
-      }
-    }
+$(build_inbounds_json)
   ],
   "outbounds": [
     {
@@ -208,12 +245,18 @@ show_links() {
   load_meta || { red "未安装"; return; }
 
   echo
-  green "Naive URI："
-  echo "https://${NAIVE_USERNAME}:${NAIVE_PASSWORD}@${DOMAIN}:${NAIVE_PORT}"
+  green "当前安装模式："
+  [[ "${ENABLE_NAIVE}" == "true" ]] && echo "- Naive: 已启用" || echo "- Naive: 未启用"
+  [[ "${ENABLE_ANYTLS}" == "true" ]] && echo "- AnyTLS: 已启用" || echo "- AnyTLS: 未启用"
 
-  echo
-  green "Naive sing-box outbound："
-  cat <<EOF
+  if [[ "${ENABLE_NAIVE}" == "true" ]]; then
+    echo
+    green "Naive URI："
+    echo "https://${NAIVE_USERNAME}:${NAIVE_PASSWORD}@${DOMAIN}:${NAIVE_PORT}"
+
+    echo
+    green "Naive sing-box outbound："
+    cat <<EOF
 {
   "type": "naive",
   "tag": "naive-out",
@@ -227,10 +270,12 @@ show_links() {
   }
 }
 EOF
+  fi
 
-  echo
-  green "AnyTLS sing-box outbound："
-  cat <<EOF
+  if [[ "${ENABLE_ANYTLS}" == "true" ]]; then
+    echo
+    green "AnyTLS sing-box outbound："
+    cat <<EOF
 {
   "type": "anytls",
   "tag": "anytls-out",
@@ -243,43 +288,69 @@ EOF
   }
 }
 EOF
+  fi
 
   echo
   green "当前服务端信息："
   echo "域名: ${DOMAIN}"
-  echo "Naive 端口: ${NAIVE_PORT}"
-  echo "Naive 用户名: ${NAIVE_USERNAME}"
-  echo "Naive 密码: ${NAIVE_PASSWORD}"
-  echo "AnyTLS 端口: ${ANYTLS_PORT}"
-  echo "AnyTLS 用户名: ${ANYTLS_NAME}"
-  echo "AnyTLS 密码: ${ANYTLS_PASSWORD}"
+  [[ "${ENABLE_NAIVE}" == "true" ]] && echo "Naive: ${NAIVE_PORT} / ${NAIVE_USERNAME} / ${NAIVE_PASSWORD}"
+  [[ "${ENABLE_ANYTLS}" == "true" ]] && echo "AnyTLS: ${ANYTLS_PORT} / ${ANYTLS_NAME} / ${ANYTLS_PASSWORD}"
+}
+
+choose_install_mode() {
+  echo
+  echo "请选择安装模式："
+  echo "1. 只安装 Naive"
+  echo "2. 只安装 AnyTLS"
+  echo "3. 同时安装 Naive + AnyTLS"
+  echo
+  read -rp "请选择 [默认3]: " mode
+  mode="${mode:-3}"
+
+  case "$mode" in
+    1) ENABLE_NAIVE="true"; ENABLE_ANYTLS="false" ;;
+    2) ENABLE_NAIVE="false"; ENABLE_ANYTLS="true" ;;
+    3) ENABLE_NAIVE="true"; ENABLE_ANYTLS="true" ;;
+    *) red "无效安装模式"; return 1 ;;
+  esac
 }
 
 install_all() {
+  choose_install_mode || return
+
   read -rp "请输入域名: " DOMAIN
   read -rp "请输入 ACME 邮箱: " EMAIL
 
-  read -rp "请输入 Naive 端口 [默认443]: " NAIVE_PORT
-  NAIVE_PORT="${NAIVE_PORT:-443}"
+  if [[ "${ENABLE_NAIVE}" == "true" ]]; then
+    read -rp "请输入 Naive 端口 [默认443]: " NAIVE_PORT
+    NAIVE_PORT="${NAIVE_PORT:-443}"
+    read -rp "请输入 Naive 用户名 [留空随机]: " NAIVE_USERNAME
+    NAIVE_USERNAME="${NAIVE_USERNAME:-naive_$(openssl rand -hex 4)}"
+    read -rp "请输入 Naive 密码 [留空随机]: " NAIVE_PASSWORD
+    NAIVE_PASSWORD="${NAIVE_PASSWORD:-$(openssl rand -base64 32 | tr -d '=+/')}"
+  else
+    NAIVE_PORT="443"
+    NAIVE_USERNAME=""
+    NAIVE_PASSWORD=""
+  fi
 
-  read -rp "请输入 AnyTLS 端口 [默认8443]: " ANYTLS_PORT
-  ANYTLS_PORT="${ANYTLS_PORT:-8443}"
-
-  read -rp "请输入 Naive 用户名 [留空随机]: " NAIVE_USERNAME
-  NAIVE_USERNAME="${NAIVE_USERNAME:-naive_$(openssl rand -hex 4)}"
-
-  read -rp "请输入 Naive 密码 [留空随机]: " NAIVE_PASSWORD
-  NAIVE_PASSWORD="${NAIVE_PASSWORD:-$(openssl rand -base64 32 | tr -d '=+/')}"
-
-  read -rp "请输入 AnyTLS 用户名 [留空随机]: " ANYTLS_NAME
-  ANYTLS_NAME="${ANYTLS_NAME:-anytls_$(openssl rand -hex 4)}"
-
-  read -rp "请输入 AnyTLS 密码 [留空随机]: " ANYTLS_PASSWORD
-  ANYTLS_PASSWORD="${ANYTLS_PASSWORD:-$(openssl rand -base64 32 | tr -d '=+/')}"
+  if [[ "${ENABLE_ANYTLS}" == "true" ]]; then
+    read -rp "请输入 AnyTLS 端口 [默认8443]: " ANYTLS_PORT
+    ANYTLS_PORT="${ANYTLS_PORT:-8443}"
+    read -rp "请输入 AnyTLS 用户名 [留空随机]: " ANYTLS_NAME
+    ANYTLS_NAME="${ANYTLS_NAME:-anytls_$(openssl rand -hex 4)}"
+    read -rp "请输入 AnyTLS 密码 [留空随机]: " ANYTLS_PASSWORD
+    ANYTLS_PASSWORD="${ANYTLS_PASSWORD:-$(openssl rand -base64 32 | tr -d '=+/')}"
+  else
+    ANYTLS_PORT="8443"
+    ANYTLS_NAME=""
+    ANYTLS_PASSWORD=""
+  fi
 
   install_deps
   install_singbox_prerelease
   enable_bbr
+  check_ports
   write_meta
   write_config
   write_service
@@ -288,8 +359,35 @@ install_all() {
   show_links
 }
 
+switch_mode() {
+  load_meta || { red "未安装"; return; }
+  choose_install_mode || return
+
+  if [[ "${ENABLE_NAIVE}" == "true" ]]; then
+    read -rp "请输入 Naive 端口 [当前 ${NAIVE_PORT:-443}]: " NEW_NAIVE_PORT
+    NAIVE_PORT="${NEW_NAIVE_PORT:-${NAIVE_PORT:-443}}"
+    [[ -n "${NAIVE_USERNAME:-}" ]] || NAIVE_USERNAME="naive_$(openssl rand -hex 4)"
+    [[ -n "${NAIVE_PASSWORD:-}" ]] || NAIVE_PASSWORD="$(openssl rand -base64 32 | tr -d '=+/')"
+  fi
+
+  if [[ "${ENABLE_ANYTLS}" == "true" ]]; then
+    read -rp "请输入 AnyTLS 端口 [当前 ${ANYTLS_PORT:-8443}]: " NEW_ANYTLS_PORT
+    ANYTLS_PORT="${NEW_ANYTLS_PORT:-${ANYTLS_PORT:-8443}}"
+    [[ -n "${ANYTLS_NAME:-}" ]] || ANYTLS_NAME="anytls_$(openssl rand -hex 4)"
+    [[ -n "${ANYTLS_PASSWORD:-}" ]] || ANYTLS_PASSWORD="$(openssl rand -base64 32 | tr -d '=+/')"
+  fi
+
+  write_meta
+  write_config
+  open_firewall
+  restart_singbox
+  green "安装模式已切换"
+  show_links
+}
+
 change_naive_password() {
   load_meta || { red "未安装"; return; }
+  [[ "${ENABLE_NAIVE}" == "true" ]] || { red "Naive 未启用"; return; }
   read -rp "请输入 Naive 新密码 [留空随机]: " NEW_PASSWORD
   NAIVE_PASSWORD="${NEW_PASSWORD:-$(openssl rand -base64 32 | tr -d '=+/')}"
   write_meta
@@ -301,6 +399,7 @@ change_naive_password() {
 
 change_anytls_password() {
   load_meta || { red "未安装"; return; }
+  [[ "${ENABLE_ANYTLS}" == "true" ]] || { red "AnyTLS 未启用"; return; }
   read -rp "请输入 AnyTLS 新密码 [留空随机]: " NEW_PASSWORD
   ANYTLS_PASSWORD="${NEW_PASSWORD:-$(openssl rand -base64 32 | tr -d '=+/')}"
   write_meta
@@ -312,12 +411,19 @@ change_anytls_password() {
 
 change_ports() {
   load_meta || { red "未安装"; return; }
-  read -rp "请输入新的 Naive 端口 [当前 ${NAIVE_PORT}]: " NEW_NAIVE_PORT
-  read -rp "请输入新的 AnyTLS 端口 [当前 ${ANYTLS_PORT}]: " NEW_ANYTLS_PORT
-  NAIVE_PORT="${NEW_NAIVE_PORT:-$NAIVE_PORT}"
-  ANYTLS_PORT="${NEW_ANYTLS_PORT:-$ANYTLS_PORT}"
-  [[ "$NAIVE_PORT" =~ ^[0-9]+$ ]] || { red "Naive 端口不合法"; return; }
-  [[ "$ANYTLS_PORT" =~ ^[0-9]+$ ]] || { red "AnyTLS 端口不合法"; return; }
+
+  if [[ "${ENABLE_NAIVE}" == "true" ]]; then
+    read -rp "请输入新的 Naive 端口 [当前 ${NAIVE_PORT}]: " NEW_NAIVE_PORT
+    NAIVE_PORT="${NEW_NAIVE_PORT:-$NAIVE_PORT}"
+    [[ "$NAIVE_PORT" =~ ^[0-9]+$ ]] || { red "Naive 端口不合法"; return; }
+  fi
+
+  if [[ "${ENABLE_ANYTLS}" == "true" ]]; then
+    read -rp "请输入新的 AnyTLS 端口 [当前 ${ANYTLS_PORT}]: " NEW_ANYTLS_PORT
+    ANYTLS_PORT="${NEW_ANYTLS_PORT:-$ANYTLS_PORT}"
+    [[ "$ANYTLS_PORT" =~ ^[0-9]+$ ]] || { red "AnyTLS 端口不合法"; return; }
+  fi
+
   write_meta
   write_config
   open_firewall
@@ -353,18 +459,19 @@ menu() {
   while true; do
     clear
     echo "========================================"
-    echo " sing-box Naive + AnyTLS 管理脚本"
+    echo " sing-box Naive / AnyTLS 管理脚本"
     echo "========================================"
-    echo "1. 安装 / 重装 Naive + AnyTLS"
+    echo "1. 安装 / 重装"
     echo "2. 查看链接 + outbound"
-    echo "3. 修改 Naive 密码"
-    echo "4. 修改 AnyTLS 密码"
-    echo "5. 修改端口"
-    echo "6. 重启 sing-box"
-    echo "7. 查看状态"
-    echo "8. 查看日志"
-    echo "9. 更新 sing-box 预发布版"
-    echo "10. 卸载 sing-box"
+    echo "3. 切换安装模式"
+    echo "4. 修改 Naive 密码"
+    echo "5. 修改 AnyTLS 密码"
+    echo "6. 修改端口"
+    echo "7. 重启 sing-box"
+    echo "8. 查看状态"
+    echo "9. 查看日志"
+    echo "10. 更新 sing-box 预发布版"
+    echo "11. 卸载 sing-box"
     echo "0. 退出"
     echo
 
@@ -373,14 +480,15 @@ menu() {
     case "$choice" in
       1) install_all ;;
       2) show_links ;;
-      3) change_naive_password ;;
-      4) change_anytls_password ;;
-      5) change_ports ;;
-      6) restart_singbox && green "已重启" ;;
-      7) systemctl status sing-box --no-pager || true ;;
-      8) journalctl -u sing-box -f ;;
-      9) update_singbox ;;
-      10) uninstall_singbox ;;
+      3) switch_mode ;;
+      4) change_naive_password ;;
+      5) change_anytls_password ;;
+      6) change_ports ;;
+      7) restart_singbox && green "已重启" ;;
+      8) systemctl status sing-box --no-pager || true ;;
+      9) journalctl -u sing-box -f ;;
+      10) update_singbox ;;
+      11) uninstall_singbox ;;
       0) exit 0 ;;
       *) red "无效选项" ;;
     esac
