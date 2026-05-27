@@ -39,16 +39,11 @@ install_singbox_prerelease() {
 
   RELEASE_JSON="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases)"
   TAG="$(echo "$RELEASE_JSON" | jq -r '[.[] | select(.prerelease == true)][0].tag_name')"
-
-  [[ -n "$TAG" && "$TAG" != "null" ]] || {
-    red "没有找到 sing-box prerelease 版本"
-    exit 1
-  }
+  [[ -n "$TAG" && "$TAG" != "null" ]] || { red "没有找到 sing-box prerelease 版本"; exit 1; }
 
   VERSION="${TAG#v}"
   FILE="sing-box-${VERSION}-linux-${SB_ARCH}.tar.gz"
   URL="https://github.com/SagerNet/sing-box/releases/download/${TAG}/${FILE}"
-
   green "安装 sing-box 预发布版: ${TAG}"
 
   TMP_DIR="$(mktemp -d)"
@@ -58,7 +53,6 @@ install_singbox_prerelease() {
   install -m 755 "sing-box-${VERSION}-linux-${SB_ARCH}/sing-box" /usr/local/bin/sing-box
   cd /
   rm -rf "$TMP_DIR"
-
   sing-box version | head -n 3
 }
 
@@ -77,6 +71,7 @@ port_in_use() {
 check_ports() {
   [[ "${ENABLE_NAIVE}" == "true" ]] && port_in_use "${NAIVE_PORT}" && yellow "警告：Naive 端口 ${NAIVE_PORT} 可能已被占用"
   [[ "${ENABLE_ANYTLS}" == "true" ]] && port_in_use "${ANYTLS_PORT}" && yellow "警告：AnyTLS 端口 ${ANYTLS_PORT} 可能已被占用"
+  [[ "${ENABLE_ANYTLS_REALITY}" == "true" ]] && port_in_use "${ANYTLS_REALITY_PORT}" && yellow "警告：AnyTLS Reality 端口 ${ANYTLS_REALITY_PORT} 可能已被占用"
 }
 
 open_firewall() {
@@ -84,14 +79,24 @@ open_firewall() {
     ufw allow 80/tcp || true
     [[ "${ENABLE_NAIVE}" == "true" ]] && ufw allow "${NAIVE_PORT}/tcp" || true
     [[ "${ENABLE_ANYTLS}" == "true" ]] && ufw allow "${ANYTLS_PORT}/tcp" || true
+    [[ "${ENABLE_ANYTLS_REALITY}" == "true" ]] && ufw allow "${ANYTLS_REALITY_PORT}/tcp" || true
   fi
-
   if command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --permanent --add-port=80/tcp || true
     [[ "${ENABLE_NAIVE}" == "true" ]] && firewall-cmd --permanent --add-port="${NAIVE_PORT}/tcp" || true
     [[ "${ENABLE_ANYTLS}" == "true" ]] && firewall-cmd --permanent --add-port="${ANYTLS_PORT}/tcp" || true
+    [[ "${ENABLE_ANYTLS_REALITY}" == "true" ]] && firewall-cmd --permanent --add-port="${ANYTLS_REALITY_PORT}/tcp" || true
     firewall-cmd --reload || true
   fi
+}
+
+generate_anytls_reality_keys() {
+  local pair
+  pair="$(sing-box generate reality-keypair)"
+  ANYTLS_REALITY_PRIVATE_KEY="$(echo "$pair" | awk '/PrivateKey|Private key|private_key/ {print $2; exit}')"
+  ANYTLS_REALITY_PUBLIC_KEY="$(echo "$pair" | awk '/PublicKey|Public key|public_key/ {print $2; exit}')"
+  [[ -n "${ANYTLS_REALITY_PRIVATE_KEY:-}" && -n "${ANYTLS_REALITY_PUBLIC_KEY:-}" ]] || { red "AnyTLS Reality 密钥生成失败"; echo "$pair"; exit 1; }
+  ANYTLS_REALITY_SHORT_ID="$(openssl rand -hex 8)"
 }
 
 write_meta() {
@@ -101,12 +106,20 @@ DOMAIN="${DOMAIN}"
 EMAIL="${EMAIL}"
 ENABLE_NAIVE="${ENABLE_NAIVE}"
 ENABLE_ANYTLS="${ENABLE_ANYTLS}"
+ENABLE_ANYTLS_REALITY="${ENABLE_ANYTLS_REALITY}"
 NAIVE_PORT="${NAIVE_PORT}"
 NAIVE_USERNAME="${NAIVE_USERNAME}"
 NAIVE_PASSWORD="${NAIVE_PASSWORD}"
 ANYTLS_PORT="${ANYTLS_PORT}"
 ANYTLS_NAME="${ANYTLS_NAME}"
 ANYTLS_PASSWORD="${ANYTLS_PASSWORD}"
+ANYTLS_REALITY_PORT="${ANYTLS_REALITY_PORT}"
+ANYTLS_REALITY_NAME="${ANYTLS_REALITY_NAME}"
+ANYTLS_REALITY_PASSWORD="${ANYTLS_REALITY_PASSWORD}"
+ANYTLS_REALITY_PRIVATE_KEY="${ANYTLS_REALITY_PRIVATE_KEY}"
+ANYTLS_REALITY_PUBLIC_KEY="${ANYTLS_REALITY_PUBLIC_KEY}"
+ANYTLS_REALITY_SHORT_ID="${ANYTLS_REALITY_SHORT_ID}"
+ANYTLS_REALITY_SNI="${ANYTLS_REALITY_SNI}"
 EOF
 }
 
@@ -115,12 +128,45 @@ load_meta() {
   source "$META_FILE"
   ENABLE_NAIVE="${ENABLE_NAIVE:-true}"
   ENABLE_ANYTLS="${ENABLE_ANYTLS:-false}"
+  ENABLE_ANYTLS_REALITY="${ENABLE_ANYTLS_REALITY:-false}"
   NAIVE_PORT="${NAIVE_PORT:-443}"
   NAIVE_USERNAME="${NAIVE_USERNAME:-}"
   NAIVE_PASSWORD="${NAIVE_PASSWORD:-}"
   ANYTLS_PORT="${ANYTLS_PORT:-8443}"
   ANYTLS_NAME="${ANYTLS_NAME:-}"
   ANYTLS_PASSWORD="${ANYTLS_PASSWORD:-}"
+  ANYTLS_REALITY_PORT="${ANYTLS_REALITY_PORT:-9443}"
+  ANYTLS_REALITY_NAME="${ANYTLS_REALITY_NAME:-}"
+  ANYTLS_REALITY_PASSWORD="${ANYTLS_REALITY_PASSWORD:-}"
+  ANYTLS_REALITY_PRIVATE_KEY="${ANYTLS_REALITY_PRIVATE_KEY:-}"
+  ANYTLS_REALITY_PUBLIC_KEY="${ANYTLS_REALITY_PUBLIC_KEY:-}"
+  ANYTLS_REALITY_SHORT_ID="${ANYTLS_REALITY_SHORT_ID:-}"
+  ANYTLS_REALITY_SNI="${ANYTLS_REALITY_SNI:-www.cloudflare.com}"
+}
+
+need_acme() {
+  [[ "${ENABLE_NAIVE}" == "true" || "${ENABLE_ANYTLS}" == "true" ]]
+}
+
+build_certificate_json() {
+  if need_acme; then
+    cat <<EOF
+  "certificate_providers": [
+    {
+      "type": "acme",
+      "tag": "shared-cert",
+      "domain": [
+        "${DOMAIN}"
+      ],
+      "email": "${EMAIL}",
+      "data_directory": "${ACME_DIR}",
+      "default_server_name": "${DOMAIN}",
+      "disable_tls_alpn_challenge": true,
+      "key_type": "p256"
+    }
+  ],
+EOF
+  fi
 }
 
 build_inbounds_json() {
@@ -173,33 +219,52 @@ EOF
       }
     }
 EOF
+    first="false"
+  fi
+
+  if [[ "${ENABLE_ANYTLS_REALITY}" == "true" ]]; then
+    [[ "$first" == "false" ]] && echo "    ,"
+    cat <<EOF
+    {
+      "type": "anytls",
+      "tag": "anytls-reality-in",
+      "listen": "::",
+      "listen_port": ${ANYTLS_REALITY_PORT},
+      "users": [
+        {
+          "name": "${ANYTLS_REALITY_NAME}",
+          "password": "${ANYTLS_REALITY_PASSWORD}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${ANYTLS_REALITY_SNI}",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "${ANYTLS_REALITY_SNI}",
+            "server_port": 443
+          },
+          "private_key": "${ANYTLS_REALITY_PRIVATE_KEY}",
+          "short_id": [
+            "${ANYTLS_REALITY_SHORT_ID}"
+          ]
+        }
+      }
+    }
+EOF
   fi
 }
 
 write_config() {
   mkdir -p "$CONFIG_DIR" "$ACME_DIR"
-
   cat > "$CONFIG_FILE" <<EOF
 {
   "log": {
     "level": "info",
     "timestamp": true
   },
-  "certificate_providers": [
-    {
-      "type": "acme",
-      "tag": "shared-cert",
-      "domain": [
-        "${DOMAIN}"
-      ],
-      "email": "${EMAIL}",
-      "data_directory": "${ACME_DIR}",
-      "default_server_name": "${DOMAIN}",
-      "disable_tls_alpn_challenge": true,
-      "key_type": "p256"
-    }
-  ],
-  "inbounds": [
+$(build_certificate_json)  "inbounds": [
 $(build_inbounds_json)
   ],
   "outbounds": [
@@ -243,17 +308,16 @@ restart_singbox() {
 
 show_links() {
   load_meta || { red "未安装"; return; }
-
   echo
   green "当前安装模式："
   [[ "${ENABLE_NAIVE}" == "true" ]] && echo "- Naive: 已启用" || echo "- Naive: 未启用"
-  [[ "${ENABLE_ANYTLS}" == "true" ]] && echo "- AnyTLS: 已启用" || echo "- AnyTLS: 未启用"
+  [[ "${ENABLE_ANYTLS}" == "true" ]] && echo "- AnyTLS TLS: 已启用" || echo "- AnyTLS TLS: 未启用"
+  [[ "${ENABLE_ANYTLS_REALITY}" == "true" ]] && echo "- AnyTLS Reality: 已启用" || echo "- AnyTLS Reality: 未启用"
 
   if [[ "${ENABLE_NAIVE}" == "true" ]]; then
     echo
     green "Naive URI："
     echo "https://${NAIVE_USERNAME}:${NAIVE_PASSWORD}@${DOMAIN}:${NAIVE_PORT}"
-
     echo
     green "Naive sing-box outbound："
     cat <<EOF
@@ -274,7 +338,7 @@ EOF
 
   if [[ "${ENABLE_ANYTLS}" == "true" ]]; then
     echo
-    green "AnyTLS sing-box outbound："
+    green "AnyTLS TLS sing-box outbound："
     cat <<EOF
 {
   "type": "anytls",
@@ -290,37 +354,67 @@ EOF
 EOF
   fi
 
+  if [[ "${ENABLE_ANYTLS_REALITY}" == "true" ]]; then
+    echo
+    green "AnyTLS Reality sing-box outbound："
+    cat <<EOF
+{
+  "type": "anytls",
+  "tag": "anytls-reality-out",
+  "server": "${DOMAIN}",
+  "server_port": ${ANYTLS_REALITY_PORT},
+  "password": "${ANYTLS_REALITY_PASSWORD}",
+  "tls": {
+    "enabled": true,
+    "server_name": "${ANYTLS_REALITY_SNI}",
+    "utls": {
+      "enabled": true,
+      "fingerprint": "chrome"
+    },
+    "reality": {
+      "enabled": true,
+      "public_key": "${ANYTLS_REALITY_PUBLIC_KEY}",
+      "short_id": "${ANYTLS_REALITY_SHORT_ID}"
+    }
+  }
+}
+EOF
+  fi
+
   echo
   green "当前服务端信息："
   echo "域名: ${DOMAIN}"
   [[ "${ENABLE_NAIVE}" == "true" ]] && echo "Naive: ${NAIVE_PORT} / ${NAIVE_USERNAME} / ${NAIVE_PASSWORD}"
-  [[ "${ENABLE_ANYTLS}" == "true" ]] && echo "AnyTLS: ${ANYTLS_PORT} / ${ANYTLS_NAME} / ${ANYTLS_PASSWORD}"
+  [[ "${ENABLE_ANYTLS}" == "true" ]] && echo "AnyTLS TLS: ${ANYTLS_PORT} / ${ANYTLS_NAME} / ${ANYTLS_PASSWORD}"
+  [[ "${ENABLE_ANYTLS_REALITY}" == "true" ]] && echo "AnyTLS Reality: ${ANYTLS_REALITY_PORT} / ${ANYTLS_REALITY_NAME} / ${ANYTLS_REALITY_PASSWORD} / SNI=${ANYTLS_REALITY_SNI} / ShortID=${ANYTLS_REALITY_SHORT_ID}"
 }
 
 choose_install_mode() {
   echo
   echo "请选择安装模式："
   echo "1. 只安装 Naive"
-  echo "2. 只安装 AnyTLS"
-  echo "3. 同时安装 Naive + AnyTLS"
+  echo "2. 只安装 AnyTLS TLS"
+  echo "3. 只安装 AnyTLS Reality"
+  echo "4. Naive + AnyTLS TLS"
+  echo "5. Naive + AnyTLS Reality"
+  echo "6. AnyTLS TLS + AnyTLS Reality"
+  echo "7. Naive + AnyTLS TLS + AnyTLS Reality"
   echo
-  read -rp "请选择 [默认3]: " mode
-  mode="${mode:-3}"
-
+  read -rp "请选择 [默认7]: " mode
+  mode="${mode:-7}"
   case "$mode" in
-    1) ENABLE_NAIVE="true"; ENABLE_ANYTLS="false" ;;
-    2) ENABLE_NAIVE="false"; ENABLE_ANYTLS="true" ;;
-    3) ENABLE_NAIVE="true"; ENABLE_ANYTLS="true" ;;
+    1) ENABLE_NAIVE="true"; ENABLE_ANYTLS="false"; ENABLE_ANYTLS_REALITY="false" ;;
+    2) ENABLE_NAIVE="false"; ENABLE_ANYTLS="true"; ENABLE_ANYTLS_REALITY="false" ;;
+    3) ENABLE_NAIVE="false"; ENABLE_ANYTLS="false"; ENABLE_ANYTLS_REALITY="true" ;;
+    4) ENABLE_NAIVE="true"; ENABLE_ANYTLS="true"; ENABLE_ANYTLS_REALITY="false" ;;
+    5) ENABLE_NAIVE="true"; ENABLE_ANYTLS="false"; ENABLE_ANYTLS_REALITY="true" ;;
+    6) ENABLE_NAIVE="false"; ENABLE_ANYTLS="true"; ENABLE_ANYTLS_REALITY="true" ;;
+    7) ENABLE_NAIVE="true"; ENABLE_ANYTLS="true"; ENABLE_ANYTLS_REALITY="true" ;;
     *) red "无效安装模式"; return 1 ;;
   esac
 }
 
-install_all() {
-  choose_install_mode || return
-
-  read -rp "请输入域名: " DOMAIN
-  read -rp "请输入 ACME 邮箱: " EMAIL
-
+prompt_protocols() {
   if [[ "${ENABLE_NAIVE}" == "true" ]]; then
     read -rp "请输入 Naive 端口 [默认443]: " NAIVE_PORT
     NAIVE_PORT="${NAIVE_PORT:-443}"
@@ -329,27 +423,55 @@ install_all() {
     read -rp "请输入 Naive 密码 [留空随机]: " NAIVE_PASSWORD
     NAIVE_PASSWORD="${NAIVE_PASSWORD:-$(openssl rand -base64 32 | tr -d '=+/')}"
   else
-    NAIVE_PORT="443"
-    NAIVE_USERNAME=""
-    NAIVE_PASSWORD=""
+    NAIVE_PORT="${NAIVE_PORT:-443}"; NAIVE_USERNAME="${NAIVE_USERNAME:-}"; NAIVE_PASSWORD="${NAIVE_PASSWORD:-}"
   fi
 
   if [[ "${ENABLE_ANYTLS}" == "true" ]]; then
-    read -rp "请输入 AnyTLS 端口 [默认8443]: " ANYTLS_PORT
+    read -rp "请输入 AnyTLS TLS 端口 [默认8443]: " ANYTLS_PORT
     ANYTLS_PORT="${ANYTLS_PORT:-8443}"
-    read -rp "请输入 AnyTLS 用户名 [留空随机]: " ANYTLS_NAME
+    read -rp "请输入 AnyTLS TLS 用户名 [留空随机]: " ANYTLS_NAME
     ANYTLS_NAME="${ANYTLS_NAME:-anytls_$(openssl rand -hex 4)}"
-    read -rp "请输入 AnyTLS 密码 [留空随机]: " ANYTLS_PASSWORD
+    read -rp "请输入 AnyTLS TLS 密码 [留空随机]: " ANYTLS_PASSWORD
     ANYTLS_PASSWORD="${ANYTLS_PASSWORD:-$(openssl rand -base64 32 | tr -d '=+/')}"
   else
-    ANYTLS_PORT="8443"
-    ANYTLS_NAME=""
-    ANYTLS_PASSWORD=""
+    ANYTLS_PORT="${ANYTLS_PORT:-8443}"; ANYTLS_NAME="${ANYTLS_NAME:-}"; ANYTLS_PASSWORD="${ANYTLS_PASSWORD:-}"
   fi
 
+  if [[ "${ENABLE_ANYTLS_REALITY}" == "true" ]]; then
+    read -rp "请输入 AnyTLS Reality 端口 [默认9443]: " ANYTLS_REALITY_PORT
+    ANYTLS_REALITY_PORT="${ANYTLS_REALITY_PORT:-9443}"
+    read -rp "请输入 AnyTLS Reality 用户名 [留空随机]: " ANYTLS_REALITY_NAME
+    ANYTLS_REALITY_NAME="${ANYTLS_REALITY_NAME:-anytls_reality_$(openssl rand -hex 4)}"
+    read -rp "请输入 AnyTLS Reality 密码 [留空随机]: " ANYTLS_REALITY_PASSWORD
+    ANYTLS_REALITY_PASSWORD="${ANYTLS_REALITY_PASSWORD:-$(openssl rand -base64 32 | tr -d '=+/')}"
+    read -rp "请输入 AnyTLS Reality SNI [默认www.cloudflare.com]: " ANYTLS_REALITY_SNI
+    ANYTLS_REALITY_SNI="${ANYTLS_REALITY_SNI:-www.cloudflare.com}"
+  else
+    ANYTLS_REALITY_PORT="${ANYTLS_REALITY_PORT:-9443}"; ANYTLS_REALITY_NAME="${ANYTLS_REALITY_NAME:-}"; ANYTLS_REALITY_PASSWORD="${ANYTLS_REALITY_PASSWORD:-}"; ANYTLS_REALITY_SNI="${ANYTLS_REALITY_SNI:-www.cloudflare.com}"
+  fi
+}
+
+ensure_anytls_reality_materials() {
+  if [[ "${ENABLE_ANYTLS_REALITY}" == "true" ]]; then
+    if [[ -z "${ANYTLS_REALITY_PRIVATE_KEY:-}" || -z "${ANYTLS_REALITY_PUBLIC_KEY:-}" || -z "${ANYTLS_REALITY_SHORT_ID:-}" ]]; then
+      generate_anytls_reality_keys
+    fi
+  fi
+}
+
+install_all() {
+  choose_install_mode || return
+  read -rp "请输入域名: " DOMAIN
+  if need_acme; then
+    read -rp "请输入 ACME 邮箱: " EMAIL
+  else
+    EMAIL=""
+  fi
+  prompt_protocols
   install_deps
   install_singbox_prerelease
   enable_bbr
+  ensure_anytls_reality_materials
   check_ports
   write_meta
   write_config
@@ -362,21 +484,11 @@ install_all() {
 switch_mode() {
   load_meta || { red "未安装"; return; }
   choose_install_mode || return
-
-  if [[ "${ENABLE_NAIVE}" == "true" ]]; then
-    read -rp "请输入 Naive 端口 [当前 ${NAIVE_PORT:-443}]: " NEW_NAIVE_PORT
-    NAIVE_PORT="${NEW_NAIVE_PORT:-${NAIVE_PORT:-443}}"
-    [[ -n "${NAIVE_USERNAME:-}" ]] || NAIVE_USERNAME="naive_$(openssl rand -hex 4)"
-    [[ -n "${NAIVE_PASSWORD:-}" ]] || NAIVE_PASSWORD="$(openssl rand -base64 32 | tr -d '=+/')"
+  prompt_protocols
+  ensure_anytls_reality_materials
+  if need_acme && [[ -z "${EMAIL:-}" ]]; then
+    read -rp "请输入 ACME 邮箱: " EMAIL
   fi
-
-  if [[ "${ENABLE_ANYTLS}" == "true" ]]; then
-    read -rp "请输入 AnyTLS 端口 [当前 ${ANYTLS_PORT:-8443}]: " NEW_ANYTLS_PORT
-    ANYTLS_PORT="${NEW_ANYTLS_PORT:-${ANYTLS_PORT:-8443}}"
-    [[ -n "${ANYTLS_NAME:-}" ]] || ANYTLS_NAME="anytls_$(openssl rand -hex 4)"
-    [[ -n "${ANYTLS_PASSWORD:-}" ]] || ANYTLS_PASSWORD="$(openssl rand -base64 32 | tr -d '=+/')"
-  fi
-
   write_meta
   write_config
   open_firewall
@@ -390,52 +502,49 @@ change_naive_password() {
   [[ "${ENABLE_NAIVE}" == "true" ]] || { red "Naive 未启用"; return; }
   read -rp "请输入 Naive 新密码 [留空随机]: " NEW_PASSWORD
   NAIVE_PASSWORD="${NEW_PASSWORD:-$(openssl rand -base64 32 | tr -d '=+/')}"
-  write_meta
-  write_config
-  restart_singbox
-  green "Naive 密码修改成功"
-  show_links
+  write_meta; write_config; restart_singbox; green "Naive 密码修改成功"; show_links
 }
 
 change_anytls_password() {
   load_meta || { red "未安装"; return; }
-  [[ "${ENABLE_ANYTLS}" == "true" ]] || { red "AnyTLS 未启用"; return; }
-  read -rp "请输入 AnyTLS 新密码 [留空随机]: " NEW_PASSWORD
+  [[ "${ENABLE_ANYTLS}" == "true" ]] || { red "AnyTLS TLS 未启用"; return; }
+  read -rp "请输入 AnyTLS TLS 新密码 [留空随机]: " NEW_PASSWORD
   ANYTLS_PASSWORD="${NEW_PASSWORD:-$(openssl rand -base64 32 | tr -d '=+/')}"
-  write_meta
-  write_config
-  restart_singbox
-  green "AnyTLS 密码修改成功"
-  show_links
+  write_meta; write_config; restart_singbox; green "AnyTLS TLS 密码修改成功"; show_links
+}
+
+change_anytls_reality_password() {
+  load_meta || { red "未安装"; return; }
+  [[ "${ENABLE_ANYTLS_REALITY}" == "true" ]] || { red "AnyTLS Reality 未启用"; return; }
+  read -rp "请输入 AnyTLS Reality 新密码 [留空随机]: " NEW_PASSWORD
+  ANYTLS_REALITY_PASSWORD="${NEW_PASSWORD:-$(openssl rand -base64 32 | tr -d '=+/')}"
+  write_meta; write_config; restart_singbox; green "AnyTLS Reality 密码修改成功"; show_links
+}
+
+regenerate_anytls_reality() {
+  load_meta || { red "未安装"; return; }
+  [[ "${ENABLE_ANYTLS_REALITY}" == "true" ]] || { red "AnyTLS Reality 未启用"; return; }
+  generate_anytls_reality_keys
+  write_meta; write_config; restart_singbox; green "AnyTLS Reality keypair / short_id 已重新生成"; show_links
 }
 
 change_ports() {
   load_meta || { red "未安装"; return; }
-
-  if [[ "${ENABLE_NAIVE}" == "true" ]]; then
-    read -rp "请输入新的 Naive 端口 [当前 ${NAIVE_PORT}]: " NEW_NAIVE_PORT
-    NAIVE_PORT="${NEW_NAIVE_PORT:-$NAIVE_PORT}"
-    [[ "$NAIVE_PORT" =~ ^[0-9]+$ ]] || { red "Naive 端口不合法"; return; }
-  fi
-
-  if [[ "${ENABLE_ANYTLS}" == "true" ]]; then
-    read -rp "请输入新的 AnyTLS 端口 [当前 ${ANYTLS_PORT}]: " NEW_ANYTLS_PORT
-    ANYTLS_PORT="${NEW_ANYTLS_PORT:-$ANYTLS_PORT}"
-    [[ "$ANYTLS_PORT" =~ ^[0-9]+$ ]] || { red "AnyTLS 端口不合法"; return; }
-  fi
-
-  write_meta
-  write_config
-  open_firewall
-  restart_singbox
-  green "端口修改成功"
-  show_links
+  if [[ "${ENABLE_NAIVE}" == "true" ]]; then read -rp "请输入新的 Naive 端口 [当前 ${NAIVE_PORT}]: " p; NAIVE_PORT="${p:-$NAIVE_PORT}"; fi
+  if [[ "${ENABLE_ANYTLS}" == "true" ]]; then read -rp "请输入新的 AnyTLS TLS 端口 [当前 ${ANYTLS_PORT}]: " p; ANYTLS_PORT="${p:-$ANYTLS_PORT}"; fi
+  if [[ "${ENABLE_ANYTLS_REALITY}" == "true" ]]; then read -rp "请输入新的 AnyTLS Reality 端口 [当前 ${ANYTLS_REALITY_PORT}]: " p; ANYTLS_REALITY_PORT="${p:-$ANYTLS_REALITY_PORT}"; fi
+  [[ "$NAIVE_PORT" =~ ^[0-9]+$ ]] || { red "Naive 端口不合法"; return; }
+  [[ "$ANYTLS_PORT" =~ ^[0-9]+$ ]] || { red "AnyTLS TLS 端口不合法"; return; }
+  [[ "$ANYTLS_REALITY_PORT" =~ ^[0-9]+$ ]] || { red "AnyTLS Reality 端口不合法"; return; }
+  write_meta; write_config; open_firewall; restart_singbox; green "端口修改成功"; show_links
 }
 
 update_singbox() {
+  load_meta || true
   install_deps
   systemctl stop sing-box || true
   install_singbox_prerelease
+  ensure_anytls_reality_materials
   restart_singbox
   green "sing-box 更新完成"
 }
@@ -443,15 +552,12 @@ update_singbox() {
 uninstall_singbox() {
   read -rp "确认卸载 sing-box 和配置？[y/N]: " yn
   [[ "$yn" =~ ^[Yy]$ ]] || return
-
   systemctl stop sing-box || true
   systemctl disable sing-box || true
   rm -f "$SERVICE_FILE"
-  rm -rf "$CONFIG_DIR"
-  rm -rf "$ACME_DIR"
+  rm -rf "$CONFIG_DIR" "$ACME_DIR"
   rm -f /usr/local/bin/sing-box
   systemctl daemon-reload
-
   green "卸载完成"
 }
 
@@ -459,40 +565,41 @@ menu() {
   while true; do
     clear
     echo "========================================"
-    echo " sing-box Naive / AnyTLS 管理脚本"
+    echo " sing-box Naive / AnyTLS / AnyTLS Reality 管理脚本"
     echo "========================================"
     echo "1. 安装 / 重装"
     echo "2. 查看链接 + outbound"
     echo "3. 切换安装模式"
     echo "4. 修改 Naive 密码"
-    echo "5. 修改 AnyTLS 密码"
-    echo "6. 修改端口"
-    echo "7. 重启 sing-box"
-    echo "8. 查看状态"
-    echo "9. 查看日志"
-    echo "10. 更新 sing-box 预发布版"
-    echo "11. 卸载 sing-box"
+    echo "5. 修改 AnyTLS TLS 密码"
+    echo "6. 修改 AnyTLS Reality 密码"
+    echo "7. 重新生成 AnyTLS Reality 密钥"
+    echo "8. 修改端口"
+    echo "9. 重启 sing-box"
+    echo "10. 查看状态"
+    echo "11. 查看日志"
+    echo "12. 更新 sing-box 预发布版"
+    echo "13. 卸载 sing-box"
     echo "0. 退出"
     echo
-
     read -rp "请选择: " choice
-
     case "$choice" in
       1) install_all ;;
       2) show_links ;;
       3) switch_mode ;;
       4) change_naive_password ;;
       5) change_anytls_password ;;
-      6) change_ports ;;
-      7) restart_singbox && green "已重启" ;;
-      8) systemctl status sing-box --no-pager || true ;;
-      9) journalctl -u sing-box -f ;;
-      10) update_singbox ;;
-      11) uninstall_singbox ;;
+      6) change_anytls_reality_password ;;
+      7) regenerate_anytls_reality ;;
+      8) change_ports ;;
+      9) restart_singbox && green "已重启" ;;
+      10) systemctl status sing-box --no-pager || true ;;
+      11) journalctl -u sing-box -f ;;
+      12) update_singbox ;;
+      13) uninstall_singbox ;;
       0) exit 0 ;;
       *) red "无效选项" ;;
     esac
-
     echo
     read -rp "按回车继续..."
   done
