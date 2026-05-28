@@ -44,8 +44,8 @@ install_singbox_prerelease() {
   VERSION="${TAG#v}"
   FILE="sing-box-${VERSION}-linux-${SB_ARCH}.tar.gz"
   URL="https://github.com/SagerNet/sing-box/releases/download/${TAG}/${FILE}"
-  green "安装 sing-box 预发布版: ${TAG}"
 
+  green "安装 sing-box 预发布版: ${TAG}"
   TMP_DIR="$(mktemp -d)"
   cd "$TMP_DIR"
   wget -O "$FILE" "$URL"
@@ -63,6 +63,10 @@ enable_bbr() {
   sysctl -p >/dev/null 2>&1 || true
 }
 
+need_acme() {
+  [[ "${ENABLE_NAIVE}" == "true" || "${ENABLE_ANYTLS}" == "true" ]]
+}
+
 port_in_use() {
   local port="$1"
   ss -lntup 2>/dev/null | grep -qE ":${port}\b"
@@ -70,19 +74,20 @@ port_in_use() {
 
 check_ports() {
   [[ "${ENABLE_NAIVE}" == "true" ]] && port_in_use "${NAIVE_PORT}" && yellow "警告：Naive 端口 ${NAIVE_PORT} 可能已被占用"
-  [[ "${ENABLE_ANYTLS}" == "true" ]] && port_in_use "${ANYTLS_PORT}" && yellow "警告：AnyTLS 端口 ${ANYTLS_PORT} 可能已被占用"
+  [[ "${ENABLE_ANYTLS}" == "true" ]] && port_in_use "${ANYTLS_PORT}" && yellow "警告：AnyTLS TLS 端口 ${ANYTLS_PORT} 可能已被占用"
   [[ "${ENABLE_ANYTLS_REALITY}" == "true" ]] && port_in_use "${ANYTLS_REALITY_PORT}" && yellow "警告：AnyTLS Reality 端口 ${ANYTLS_REALITY_PORT} 可能已被占用"
 }
 
 open_firewall() {
   if command -v ufw >/dev/null 2>&1; then
-    ufw allow 80/tcp || true
+    need_acme && ufw allow 80/tcp || true
     [[ "${ENABLE_NAIVE}" == "true" ]] && ufw allow "${NAIVE_PORT}/tcp" || true
     [[ "${ENABLE_ANYTLS}" == "true" ]] && ufw allow "${ANYTLS_PORT}/tcp" || true
     [[ "${ENABLE_ANYTLS_REALITY}" == "true" ]] && ufw allow "${ANYTLS_REALITY_PORT}/tcp" || true
   fi
+
   if command -v firewall-cmd >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port=80/tcp || true
+    need_acme && firewall-cmd --permanent --add-port=80/tcp || true
     [[ "${ENABLE_NAIVE}" == "true" ]] && firewall-cmd --permanent --add-port="${NAIVE_PORT}/tcp" || true
     [[ "${ENABLE_ANYTLS}" == "true" ]] && firewall-cmd --permanent --add-port="${ANYTLS_PORT}/tcp" || true
     [[ "${ENABLE_ANYTLS_REALITY}" == "true" ]] && firewall-cmd --permanent --add-port="${ANYTLS_REALITY_PORT}/tcp" || true
@@ -102,7 +107,8 @@ generate_anytls_reality_keys() {
 write_meta() {
   mkdir -p "$CONFIG_DIR"
   cat > "$META_FILE" <<EOF
-DOMAIN="${DOMAIN}"
+SERVER_HOST="${SERVER_HOST}"
+CERT_DOMAIN="${CERT_DOMAIN}"
 EMAIL="${EMAIL}"
 ENABLE_NAIVE="${ENABLE_NAIVE}"
 ENABLE_ANYTLS="${ENABLE_ANYTLS}"
@@ -126,6 +132,9 @@ EOF
 load_meta() {
   [[ -f "$META_FILE" ]] || return 1
   source "$META_FILE"
+  SERVER_HOST="${SERVER_HOST:-${DOMAIN:-}}"
+  CERT_DOMAIN="${CERT_DOMAIN:-${DOMAIN:-}}"
+  EMAIL="${EMAIL:-}"
   ENABLE_NAIVE="${ENABLE_NAIVE:-true}"
   ENABLE_ANYTLS="${ENABLE_ANYTLS:-false}"
   ENABLE_ANYTLS_REALITY="${ENABLE_ANYTLS_REALITY:-false}"
@@ -141,11 +150,7 @@ load_meta() {
   ANYTLS_REALITY_PRIVATE_KEY="${ANYTLS_REALITY_PRIVATE_KEY:-}"
   ANYTLS_REALITY_PUBLIC_KEY="${ANYTLS_REALITY_PUBLIC_KEY:-}"
   ANYTLS_REALITY_SHORT_ID="${ANYTLS_REALITY_SHORT_ID:-}"
-  ANYTLS_REALITY_SNI="${ANYTLS_REALITY_SNI:-www.cloudflare.com}"
-}
-
-need_acme() {
-  [[ "${ENABLE_NAIVE}" == "true" || "${ENABLE_ANYTLS}" == "true" ]]
+  ANYTLS_REALITY_SNI="${ANYTLS_REALITY_SNI:-www.bing.com}"
 }
 
 build_certificate_json() {
@@ -156,11 +161,11 @@ build_certificate_json() {
       "type": "acme",
       "tag": "shared-cert",
       "domain": [
-        "${DOMAIN}"
+        "${CERT_DOMAIN}"
       ],
       "email": "${EMAIL}",
       "data_directory": "${ACME_DIR}",
-      "default_server_name": "${DOMAIN}",
+      "default_server_name": "${CERT_DOMAIN}",
       "disable_tls_alpn_challenge": true,
       "key_type": "p256"
     }
@@ -188,7 +193,7 @@ build_inbounds_json() {
       ],
       "tls": {
         "enabled": true,
-        "server_name": "${DOMAIN}",
+        "server_name": "${CERT_DOMAIN}",
         "certificate_provider": "shared-cert",
         "handshake_timeout": "15s"
       }
@@ -213,7 +218,7 @@ EOF
       ],
       "tls": {
         "enabled": true,
-        "server_name": "${DOMAIN}",
+        "server_name": "${CERT_DOMAIN}",
         "certificate_provider": "shared-cert",
         "handshake_timeout": "15s"
       }
@@ -317,20 +322,20 @@ show_links() {
   if [[ "${ENABLE_NAIVE}" == "true" ]]; then
     echo
     green "Naive URI："
-    echo "https://${NAIVE_USERNAME}:${NAIVE_PASSWORD}@${DOMAIN}:${NAIVE_PORT}"
+    echo "https://${NAIVE_USERNAME}:${NAIVE_PASSWORD}@${CERT_DOMAIN}:${NAIVE_PORT}"
     echo
     green "Naive sing-box outbound："
     cat <<EOF
 {
   "type": "naive",
   "tag": "naive-out",
-  "server": "${DOMAIN}",
+  "server": "${SERVER_HOST}",
   "server_port": ${NAIVE_PORT},
   "username": "${NAIVE_USERNAME}",
   "password": "${NAIVE_PASSWORD}",
   "tls": {
     "enabled": true,
-    "server_name": "${DOMAIN}"
+    "server_name": "${CERT_DOMAIN}"
   }
 }
 EOF
@@ -343,12 +348,12 @@ EOF
 {
   "type": "anytls",
   "tag": "anytls-out",
-  "server": "${DOMAIN}",
+  "server": "${SERVER_HOST}",
   "server_port": ${ANYTLS_PORT},
   "password": "${ANYTLS_PASSWORD}",
   "tls": {
     "enabled": true,
-    "server_name": "${DOMAIN}"
+    "server_name": "${CERT_DOMAIN}"
   }
 }
 EOF
@@ -361,7 +366,7 @@ EOF
 {
   "type": "anytls",
   "tag": "anytls-reality-out",
-  "server": "${DOMAIN}",
+  "server": "${SERVER_HOST}",
   "server_port": ${ANYTLS_REALITY_PORT},
   "password": "${ANYTLS_REALITY_PASSWORD}",
   "tls": {
@@ -383,7 +388,8 @@ EOF
 
   echo
   green "当前服务端信息："
-  echo "域名: ${DOMAIN}"
+  echo "连接地址: ${SERVER_HOST}"
+  need_acme && echo "证书域名: ${CERT_DOMAIN}"
   [[ "${ENABLE_NAIVE}" == "true" ]] && echo "Naive: ${NAIVE_PORT} / ${NAIVE_USERNAME} / ${NAIVE_PASSWORD}"
   [[ "${ENABLE_ANYTLS}" == "true" ]] && echo "AnyTLS TLS: ${ANYTLS_PORT} / ${ANYTLS_NAME} / ${ANYTLS_PASSWORD}"
   [[ "${ENABLE_ANYTLS_REALITY}" == "true" ]] && echo "AnyTLS Reality: ${ANYTLS_REALITY_PORT} / ${ANYTLS_REALITY_NAME} / ${ANYTLS_REALITY_PASSWORD} / SNI=${ANYTLS_REALITY_SNI} / ShortID=${ANYTLS_REALITY_SHORT_ID}"
@@ -392,9 +398,9 @@ EOF
 choose_install_mode() {
   echo
   echo "请选择安装模式："
-  echo "1. 只安装 Naive"
-  echo "2. 只安装 AnyTLS TLS"
-  echo "3. 只安装 AnyTLS Reality"
+  echo "1. 只安装 Naive（需要证书域名 + ACME）"
+  echo "2. 只安装 AnyTLS TLS（需要证书域名 + ACME）"
+  echo "3. 只安装 AnyTLS Reality（不需要域名/ACME，可直接用 VPS IP）"
   echo "4. Naive + AnyTLS TLS"
   echo "5. Naive + AnyTLS Reality"
   echo "6. AnyTLS TLS + AnyTLS Reality"
@@ -412,6 +418,20 @@ choose_install_mode() {
     7) ENABLE_NAIVE="true"; ENABLE_ANYTLS="true"; ENABLE_ANYTLS_REALITY="true" ;;
     *) red "无效安装模式"; return 1 ;;
   esac
+}
+
+prompt_common() {
+  read -rp "请输入客户端连接地址 SERVER_HOST（VPS IP 或域名）: " SERVER_HOST
+  [[ -n "$SERVER_HOST" ]] || { red "SERVER_HOST 不能为空"; return 1; }
+  if need_acme; then
+    read -rp "请输入证书域名 CERT_DOMAIN（默认同 SERVER_HOST，必须已解析到 VPS）: " CERT_DOMAIN
+    CERT_DOMAIN="${CERT_DOMAIN:-$SERVER_HOST}"
+    read -rp "请输入 ACME 邮箱: " EMAIL
+    [[ -n "$EMAIL" ]] || { red "需要 ACME 邮箱"; return 1; }
+  else
+    CERT_DOMAIN=""
+    EMAIL=""
+  fi
 }
 
 prompt_protocols() {
@@ -444,10 +464,10 @@ prompt_protocols() {
     ANYTLS_REALITY_NAME="${ANYTLS_REALITY_NAME:-anytls_reality_$(openssl rand -hex 4)}"
     read -rp "请输入 AnyTLS Reality 密码 [留空随机]: " ANYTLS_REALITY_PASSWORD
     ANYTLS_REALITY_PASSWORD="${ANYTLS_REALITY_PASSWORD:-$(openssl rand -base64 32 | tr -d '=+/')}"
-    read -rp "请输入 AnyTLS Reality SNI [默认www.cloudflare.com]: " ANYTLS_REALITY_SNI
-    ANYTLS_REALITY_SNI="${ANYTLS_REALITY_SNI:-www.cloudflare.com}"
+    read -rp "请输入 AnyTLS Reality 伪装 SNI [默认www.bing.com]: " ANYTLS_REALITY_SNI
+    ANYTLS_REALITY_SNI="${ANYTLS_REALITY_SNI:-www.bing.com}"
   else
-    ANYTLS_REALITY_PORT="${ANYTLS_REALITY_PORT:-9443}"; ANYTLS_REALITY_NAME="${ANYTLS_REALITY_NAME:-}"; ANYTLS_REALITY_PASSWORD="${ANYTLS_REALITY_PASSWORD:-}"; ANYTLS_REALITY_SNI="${ANYTLS_REALITY_SNI:-www.cloudflare.com}"
+    ANYTLS_REALITY_PORT="${ANYTLS_REALITY_PORT:-9443}"; ANYTLS_REALITY_NAME="${ANYTLS_REALITY_NAME:-}"; ANYTLS_REALITY_PASSWORD="${ANYTLS_REALITY_PASSWORD:-}"; ANYTLS_REALITY_SNI="${ANYTLS_REALITY_SNI:-www.bing.com}"
   fi
 }
 
@@ -461,12 +481,7 @@ ensure_anytls_reality_materials() {
 
 install_all() {
   choose_install_mode || return
-  read -rp "请输入域名: " DOMAIN
-  if need_acme; then
-    read -rp "请输入 ACME 邮箱: " EMAIL
-  else
-    EMAIL=""
-  fi
+  prompt_common || return
   prompt_protocols
   install_deps
   install_singbox_prerelease
@@ -484,11 +499,17 @@ install_all() {
 switch_mode() {
   load_meta || { red "未安装"; return; }
   choose_install_mode || return
+  read -rp "请输入客户端连接地址 SERVER_HOST [当前 ${SERVER_HOST}]: " NEW_SERVER_HOST
+  SERVER_HOST="${NEW_SERVER_HOST:-$SERVER_HOST}"
+  if need_acme; then
+    read -rp "请输入证书域名 CERT_DOMAIN [当前 ${CERT_DOMAIN:-$SERVER_HOST}]: " NEW_CERT_DOMAIN
+    CERT_DOMAIN="${NEW_CERT_DOMAIN:-${CERT_DOMAIN:-$SERVER_HOST}}"
+    if [[ -z "${EMAIL:-}" ]]; then read -rp "请输入 ACME 邮箱: " EMAIL; fi
+  else
+    CERT_DOMAIN=""; EMAIL=""
+  fi
   prompt_protocols
   ensure_anytls_reality_materials
-  if need_acme && [[ -z "${EMAIL:-}" ]]; then
-    read -rp "请输入 ACME 邮箱: " EMAIL
-  fi
   write_meta
   write_config
   open_firewall
